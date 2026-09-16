@@ -11,7 +11,7 @@
 | 漏洞类型 | 内核驱动访问控制缺失 / 暴露的 IOCTL 未做调用者鉴权（CWE-266、CWE-284） |
 | 攻击向量 | 本地，低权限已认证用户，无需交互 |
 | CVSS v3.1 | `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H`，8.8 |
-| CVSS v4.0 | `CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H/E:P`，8.5 |
+| CVSS v4.0 | `CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H/E:P`，9.3 |
 
 ---
 
